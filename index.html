@@ -432,6 +432,9 @@ input[type=range]::-moz-range-thumb{
 }
 .kill:hover{color:var(--bright);}
 
+.datamsg{margin-top:var(--s3); font-size:var(--t-sm); color:var(--body); min-height:1.55em; max-width:66ch;}
+.datamsg .btn{padding:0 0 0 var(--s2); vertical-align:baseline;}
+
 .empty{
   padding:var(--s5) 0;
   color:var(--muted);
@@ -697,6 +700,21 @@ input[type=range]::-moz-range-thumb{
           <tbody id="bests"></tbody>
         </table>
 
+        <hr class="sep">
+        <div class="viewhead"><h2 style="font-size:var(--t-md)">your data</h2></div>
+        <p class="blurb">
+          a backup is everything above plus your tasks, as one json file. restoring one
+          replaces what is here, and you can undo it until you leave this page.
+          the csv is sessions per day, for a spreadsheet.
+        </p>
+        <div class="row">
+          <button class="btn" id="exp-json">export backup (.json)</button>
+          <button class="btn" id="imp-json">restore backup</button>
+          <button class="btn" id="exp-csv">export sessions (.csv)</button>
+          <input type="file" id="imp-file" accept=".json,application/json" hidden>
+        </div>
+        <div class="datamsg" id="data-msg" role="status"></div>
+
         <div class="row" style="margin-top:24px">
           <button class="btn ghost" id="wipe">erase all saved data</button>
         </div>
@@ -795,6 +813,7 @@ const Store = (() => {
   let data = DEFAULTS();
   let durable = false;
   let corrupt = false;
+  let rawCorrupt = null;
 
   function load(){
     let raw = null;
@@ -820,6 +839,7 @@ const Store = (() => {
       // unreadable save: never write over it, so nothing more is lost.
       // erasing all data is the explicit way out.
       corrupt = true;
+      rawCorrupt = raw;
       durable = false;
     }
   }
@@ -830,11 +850,20 @@ const Store = (() => {
     catch(e){ durable = false; renderStorageFlag(); }
   }
 
+  // restore: an explicit choice, so it may write over a corrupt save.
+  // returns whether the result actually reached storage.
+  function replace(next){
+    data = next;
+    if(corrupt){ corrupt = false; rawCorrupt = null; durable = true; }
+    save();
+    return durable;
+  }
+
   function wipe(){
     data = DEFAULTS();
     try{
       localStorage.removeItem(KEY);
-      if(corrupt){ corrupt = false; durable = true; }
+      if(corrupt){ corrupt = false; rawCorrupt = null; durable = true; }
     }catch(e){}
   }
 
@@ -843,7 +872,8 @@ const Store = (() => {
     get d(){ return data; },
     get durable(){ return durable; },
     get corrupt(){ return corrupt; },
-    save, wipe
+    get rawCorrupt(){ return rawCorrupt; },
+    save, wipe, replace
   };
 })();
 
@@ -1684,8 +1714,116 @@ $("#wipe").addEventListener("click", e => {
   clearTimeout(wipeArmed); wipeArmed = null;
   btn.textContent = "erase all saved data";
   Store.wipe();
+  restoreUndo = null; dataMsg("");
   renderAll();
   toast("erased");
+});
+
+/* ============================================================
+   8b. backup, restore, csv
+   A backup file is { app, exportedAt, data }. Restore treats the file as
+   untrusted: every field is rebuilt from known keys and types, so a hand-
+   edited or foreign file can't put a non-string into escapeHtml or a
+   non-number into the chart.
+   ============================================================ */
+const APP_ID = "focus-terminal";
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+let restoreUndo = null;   // the data a restore replaced, until the page is left
+
+function download(name, text, type){
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], {type}));
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function dataMsg(text, undo){
+  const el = $("#data-msg");
+  el.textContent = text;
+  if(undo){
+    const b = document.createElement("button");
+    b.className = "btn ghost"; b.id = "restore-undo"; b.textContent = "undo";
+    el.appendChild(b);
+  }
+}
+
+const num = (v, min=0) => (typeof v === "number" && isFinite(v) && v >= min) ? v : null;
+
+// returns clean data, or a string saying why the file was refused
+function cleanBackup(o){
+  if(!o || typeof o !== "object" || Array.isArray(o)) return "that file isn't a focus terminal backup.";
+  const src = (o.data && typeof o.data === "object") ? o.data : o;
+  if(!src.days || typeof src.days !== "object" || !Array.isArray(src.tasks))
+    return "that file isn't a focus terminal backup.";
+  if((num(src.v) || 1) > SCHEMA_VERSION)
+    return "that backup is from a newer version (v" + src.v + ") than this page (v" + SCHEMA_VERSION + ").";
+
+  const d = DEFAULTS();
+  d.v = num(src.v) || 1;
+  for(const [k, v] of Object.entries(src.days))
+    if(DATE_RE.test(k) && num(v) !== null) d.days[k] = Math.round(v);
+  d.streak     = num(src.streak) || 0;
+  d.bestStreak = num(src.bestStreak) || 0;
+  d.sessions   = num(src.sessions) || 0;
+  d.lastDay    = (typeof src.lastDay === "string" && DATE_RE.test(src.lastDay)) ? src.lastDay : null;
+  const best = (src.best && typeof src.best === "object") ? src.best : {};
+  DRILLS.forEach(dr => { if(num(best[dr.id]) !== null) d.best[dr.id] = best[dr.id]; });
+  d.tasks = src.tasks
+    .filter(t => t && typeof t.text === "string" && t.text.trim())
+    .map((t, i) => ({ id: String(t.id ?? (Date.now() + "" + i)), text: t.text.slice(0, 140), done: t.done === true }));
+  return migrate(d);
+}
+
+$("#exp-json").addEventListener("click", () => {
+  if(Store.corrupt){
+    // the in-memory data is blank; the only thing worth saving is the damaged original
+    download(APP_ID + "-corrupt-save-" + todayKey() + ".txt", Store.rawCorrupt, "text/plain");
+    dataMsg("your save is corrupt, so this downloaded the damaged original as text, untouched.");
+    return;
+  }
+  download(APP_ID + "-backup-" + todayKey() + ".json",
+    JSON.stringify({ app: APP_ID, exportedAt: new Date().toISOString(), data: Store.d }, null, 2),
+    "application/json");
+  dataMsg("backup saved: " + Object.keys(Store.d.days).length + " active days, " + Store.d.tasks.length + " tasks.");
+});
+
+$("#exp-csv").addEventListener("click", () => {
+  const rows = Object.keys(Store.d.days).sort().map(k => k + "," + Store.d.days[k]);
+  download(APP_ID + "-sessions-" + todayKey() + ".csv", ["date,sessions", ...rows].join("\n") + "\n", "text/csv");
+  dataMsg("csv saved: " + rows.length + " days.");
+});
+
+$("#imp-json").addEventListener("click", () => $("#imp-file").click());
+
+$("#imp-file").addEventListener("change", e => {
+  const file = e.target.files[0];
+  e.target.value = "";   // so picking the same file again still fires
+  if(!file) return;
+  file.text().then(text => {
+    let parsed;
+    try{ parsed = JSON.parse(text); }
+    catch(err){ dataMsg("that file isn't valid json, so nothing was changed."); return; }
+    const next = cleanBackup(parsed);
+    if(typeof next === "string"){ dataMsg(next + " nothing was changed."); return; }
+    const wasCorrupt = Store.corrupt;
+    restoreUndo = wasCorrupt ? null : JSON.parse(JSON.stringify(Store.d));
+    const saved = Store.replace(next);
+    renderAll();
+    const when = (parsed.exportedAt || "").slice(0, 10);
+    dataMsg("restored" + (when ? " backup from " + when : "") + ": " +
+      Object.keys(next.days).length + " active days, " + next.tasks.length + " tasks." +
+      (wasCorrupt ? " it replaced the corrupt save." : "") +
+      (saved ? "" : " storage is unavailable, so this lasts only until you close the page."), !!restoreUndo);
+  }, () => dataMsg("couldn't read that file, so nothing was changed."));
+});
+
+$("#data-msg").addEventListener("click", e => {
+  if(e.target.id !== "restore-undo" || !restoreUndo) return;
+  Store.replace(restoreUndo);
+  restoreUndo = null;
+  renderAll();
+  dataMsg("restore undone. your previous data is back.");
 });
 
 /* ============================================================

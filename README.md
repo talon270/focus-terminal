@@ -67,5 +67,30 @@ meet.
 - **Corrupt save:** the footer says `corrupt save, not overwriting` and the
   page never writes over the damaged data. "Erase all saved data" (two clicks,
   no dialog) is the way out.
-- **Browser only:** it's all in this browser. Clearing site data erases it, and
-  there's no export yet.
+- **Browser only:** it's all in this browser, and clearing site data erases it.
+  Take a backup if you care about the history.
+
+## Backup, restore and export
+
+All three are at the bottom of **stats**.
+
+| Button | What you get |
+|---|---|
+| export backup (.json) | Everything (days, streaks, bests, tasks) as `focus-terminal-backup-YYYY-MM-DD.json` |
+| restore backup | Replaces what's here with a backup file. An **undo** link stays up until you leave the page |
+| export sessions (.csv) | `date,sessions`, one row per active day, for a spreadsheet |
+
+**A restore file is treated as untrusted.** Every field is rebuilt from known
+keys and types. Dates must look like dates, bests must be numbers for drills
+that exist, and tasks must be non-empty strings of at most 140 characters.
+Anything else is dropped, not guessed at. A file that isn't valid JSON, isn't
+a focus terminal backup, or comes from a newer schema version is refused with
+an inline message, and nothing changes.
+
+**Restoring a v1 backup applies the v1 → v2 migration.** You get the same
+result as if the save had been upgraded in place.
+
+**When the save is corrupt, "export backup" downloads the damaged original as
+text instead.** At that point the page's own data is blank, so the untouched
+original is the only thing worth keeping. Restoring a backup then replaces the
+corrupt save and turns storage back on.
